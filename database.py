@@ -11,6 +11,14 @@ class DomainError(ValueError):
     """Business rule violation."""
 
 
+class RevisionConflict(DomainError):
+    """Confirm was based on an outdated shot revision; carries both sides."""
+
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload.get("error", "镜头已被他人修改，请重新试算"))
+        self.payload = payload
+
+
 ELEMENT_KINDS = {"character", "costume", "prop", "injury"}
 RULES = {"stable", "monotonic", "allowed"}
 
@@ -141,6 +149,20 @@ class ContinuityDB:
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS state_change_records (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              element_id INTEGER NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+              from_value TEXT,
+              from_numeric REAL,
+              to_value TEXT NOT NULL,
+              to_numeric REAL,
+              from_version INTEGER NOT NULL,
+              to_version INTEGER NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              changed_by INTEGER NOT NULL REFERENCES users(id),
+              changed_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -256,12 +278,8 @@ class ContinuityDB:
                 raise DomainError("该状态转移已存在") from exc
         return int(cur.lastrowid)
 
-    def set_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
-                          note: str, user_id: int) -> dict:
-        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
-        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
-        if not shot or not element or shot["production_id"] != element["production_id"]:
-            raise DomainError("镜头与元素不属于同一项目")
+    def _validate_state_change(self, shot: sqlite3.Row, element: sqlite3.Row,
+                               state_value: str, numeric_value: float | None, user_id: int) -> sqlite3.Row:
         user = self._production_for_user(shot["production_id"], user_id)
         if user["role"] not in {"producer", "continuity"}:
             raise DomainError("无权修改连续性状态")
@@ -271,23 +289,191 @@ class ContinuityDB:
             raise DomainError("状态值不能为空")
         if element["rule"] == "monotonic" and numeric_value is None:
             raise DomainError("单调规则必须提供 numeric_value")
-        with self.transaction():
-            try:
-                self.conn.execute(
-                    "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (shot_id, element_id, state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat()),
-                )
-            except sqlite3.IntegrityError:
-                self.conn.execute(
-                    "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                    (state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat(), shot_id, element_id),
-                )
-            self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
-            self._sync_conflicts(shot["scene_id"])
-        return {"shot_id": shot_id, "element_id": element_id, "conflicts": self.list_conflicts(shot["scene_id"])}
+        return user
 
-    def _detect_conflicts(self, scene_id: int) -> list[dict]:
+    def shot_info(self, shot_id: int) -> dict:
+        shot = self.conn.execute(
+            "SELECT s.*,sc.id AS scene_id,sc.scene_number,sc.production_id "
+            "FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)
+        ).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        states = []
+        for row in self.conn.execute(
+            "SELECT es.*,e.name AS element_name,e.kind,e.rule FROM element_states es "
+            "JOIN elements e ON e.id=es.element_id WHERE es.shot_id=? ORDER BY e.id", (shot_id,)
+        ).fetchall():
+            states.append(dict(row))
+        records = [dict(r) for r in self.conn.execute(
+            "SELECT r.*,e.name AS element_name,u.name AS changed_by_name FROM state_change_records r "
+            "JOIN elements e ON e.id=r.element_id JOIN users u ON u.id=r.changed_by "
+            "WHERE r.shot_id=? ORDER BY r.id DESC", (shot_id,)
+        ).fetchall()]
+        return {"shot": dict(shot), "states": states, "records": records}
+
+    def _shot_lookup(self, scene_id: int) -> dict[int, sqlite3.Row]:
+        return {row["id"]: row for row in self.conn.execute(
+            "SELECT * FROM shots WHERE scene_id=?", (scene_id,)).fetchall()}
+
+    def _enrich_issues(self, issues: list[dict], lookup: dict[int, sqlite3.Row]) -> list[dict]:
+        enriched = []
+        for issue in issues:
+            enriched.append({**issue,
+                             "from_shot_code": lookup[issue["from_shot_id"]]["shot_code"],
+                             "to_shot_code": lookup[issue["to_shot_id"]]["shot_code"]})
+        return enriched
+
+    def preview_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
+                              note: str, user_id: int) -> dict:
+        """Dry-run the change against the shot's current revision; nothing is saved."""
+        shot = self.conn.execute(
+            "SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)
+        ).fetchone()
+        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
+        if not shot or not element or shot["production_id"] != element["production_id"]:
+            raise DomainError("镜头与元素不属于同一项目")
+        self._validate_state_change(shot, element, state_value, numeric_value, user_id)
+
+        current = self.conn.execute(
+            "SELECT * FROM element_states WHERE shot_id=? AND element_id=?", (shot_id, element_id)
+        ).fetchone()
+        current_payload = ({"state_value": current["state_value"], "numeric_value": current["numeric_value"]}
+                           if current else None)
+        proposed = {"state_value": state_value.strip(), "numeric_value": numeric_value}
+        no_change = current is not None and current["state_value"] == state_value.strip() and (
+            (current["numeric_value"] is None and numeric_value is None)
+            or (current["numeric_value"] is not None and numeric_value is not None
+                and float(current["numeric_value"]) == float(numeric_value)))
+
+        lookup = self._shot_lookup(shot["scene_id"])
+        baseline = self._detect_conflicts(shot["scene_id"])
+        trial = self._detect_conflicts(shot["scene_id"], overrides={(shot_id, element_id): proposed})
+        before_fp = {i["fingerprint"]: i for i in baseline}
+        after_fp = {i["fingerprint"]: i for i in trial}
+        added = self._enrich_issues([i for fp, i in after_fp.items() if fp not in before_fp], lookup)
+        removed = self._enrich_issues([i for fp, i in before_fp.items() if fp not in after_fp], lookup)
+        active_before = len(before_fp)
+        active_after = len(after_fp)
+
+        affected: dict[int, dict] = {}
+
+        def mark(sid: int, via: str):
+            row = lookup.get(sid)
+            if not row:
+                return
+            affected.setdefault(sid, {
+                "shot_id": sid, "shot_code": row["shot_code"],
+                "narrative_order": row["narrative_order"], "reasons": set()})["reasons"].add(via)
+
+        mark(shot_id, "edited")
+        for issue in added:
+            mark(issue["from_shot_id"], "new_conflict")
+            mark(issue["to_shot_id"], "new_conflict")
+        for issue in removed:
+            mark(issue["from_shot_id"], "resolved_conflict")
+            mark(issue["to_shot_id"], "resolved_conflict")
+        affected_shots = []
+        for item in sorted(affected.values(), key=lambda x: x["narrative_order"]):
+            item["reasons"] = sorted(item["reasons"])
+            affected_shots.append(item)
+
+        return {
+            "saved": False,
+            "shot_id": shot_id,
+            "element_id": element_id,
+            "element_name": element["name"],
+            "revision": shot["version"],
+            "locked": shot["status"] == "locked",
+            "current": current_payload,
+            "proposed": proposed,
+            "note": note.strip(),
+            "no_change": no_change,
+            "conflicts_added": added,
+            "conflicts_removed": removed,
+            "active_conflicts_before": active_before,
+            "active_conflicts_after": active_after,
+            "affected_shots": affected_shots,
+        }
+
+    def commit_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
+                             note: str, user_id: int, expected_version: int) -> dict:
+        shot = self.conn.execute(
+            "SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)
+        ).fetchone()
+        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
+        if not shot or not element or shot["production_id"] != element["production_id"]:
+            raise DomainError("镜头与元素不属于同一项目")
+        self._validate_state_change(shot, element, state_value, numeric_value, user_id)
+        with self.transaction():
+            current_shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (shot_id,)).fetchone()
+            if current_shot["status"] == "locked":
+                raise DomainError("镜头已锁定，不能直接修改状态")
+            if current_shot["version"] != expected_version:
+                current_state = self.conn.execute(
+                    "SELECT state_value,numeric_value FROM element_states WHERE shot_id=? AND element_id=?",
+                    (shot_id, element_id),
+                ).fetchone()
+                raise RevisionConflict({
+                    "error": f"镜头修订号已从 {expected_version} 变为 {current_shot['version']}，请重新试算后确认",
+                    "shot_id": shot_id,
+                    "element_id": element_id,
+                    "expected_revision": expected_version,
+                    "current_revision": current_shot["version"],
+                    "submitted": {"state_value": state_value.strip(), "numeric_value": numeric_value},
+                    "server_state": (dict(current_state) if current_state else None),
+                })
+            record_id, new_version = self._apply_state(
+                shot_id, element_id, state_value.strip(), numeric_value, note.strip(), user_id,
+                current_shot["version"])
+            self._sync_conflicts(shot["scene_id"])
+        return {"saved": True, "shot_id": shot_id, "element_id": element_id,
+                "revision": new_version, "record_id": record_id,
+                "conflicts": self.list_conflicts(shot["scene_id"])}
+
+    def _apply_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
+                     note: str, user_id: int, from_version: int) -> tuple[int, int]:
+        previous = self.conn.execute(
+            "SELECT state_value,numeric_value FROM element_states WHERE shot_id=? AND element_id=?",
+            (shot_id, element_id),
+        ).fetchone()
+        now = datetime.now().isoformat()
+        try:
+            self.conn.execute(
+                "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (shot_id, element_id, state_value, numeric_value, note, user_id, now),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.execute(
+                "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? "
+                "WHERE shot_id=? AND element_id=?",
+                (state_value, numeric_value, note, user_id, now, shot_id, element_id),
+            )
+        new_version = from_version + 1
+        cur = self.conn.execute(
+            "INSERT INTO state_change_records(shot_id,element_id,from_value,from_numeric,to_value,to_numeric,"
+            "from_version,to_version,note,changed_by,changed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (shot_id, element_id,
+             previous["state_value"] if previous else None,
+             previous["numeric_value"] if previous else None,
+             state_value, numeric_value, from_version, new_version, note, user_id, now),
+        )
+        self.conn.execute("UPDATE shots SET version=?,updated_by=?,updated_at=? WHERE id=?",
+                          (new_version, user_id, now, shot_id))
+        return int(cur.lastrowid), new_version
+
+    def set_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
+                          note: str, user_id: int) -> dict:
+        """Compatibility wrapper: commit against whatever revision the shot currently has."""
+        shot = self.conn.execute("SELECT version FROM shots WHERE id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        result = self.commit_element_state(shot_id, element_id, state_value, numeric_value, note, user_id,
+                                           shot["version"])
+        return {"shot_id": shot_id, "element_id": element_id, "conflicts": result["conflicts"]}
+
+    def _detect_conflicts(self, scene_id: int,
+                          overrides: dict[tuple[int, int], dict] | None = None) -> list[dict]:
         scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
         if not scene:
             raise DomainError("场次不存在")
@@ -295,13 +481,16 @@ class ContinuityDB:
             "SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene_id,)
         ).fetchall()
         elements = self.conn.execute("SELECT * FROM elements WHERE production_id=? ORDER BY id", (scene["production_id"],)).fetchall()
+        overrides = overrides or {}
         detected: list[dict] = []
         for element in elements:
             sequence = []
             for shot in shots:
-                state = self.conn.execute(
-                    "SELECT * FROM element_states WHERE shot_id=? AND element_id=?", (shot["id"], element["id"])
-                ).fetchone()
+                state = overrides.get((shot["id"], element["id"]))
+                if state is None:
+                    state = self.conn.execute(
+                        "SELECT * FROM element_states WHERE shot_id=? AND element_id=?", (shot["id"], element["id"])
+                    ).fetchone()
                 if state:
                     sequence.append((shot, state))
             for (prev_shot, prev), (shot, current) in zip(sequence, sequence[1:]):
@@ -422,16 +611,13 @@ class ContinuityDB:
                 (status, reviewer_id, note.strip(), datetime.now().isoformat(), plan_id),
             )
             if approve:
-                try:
-                    self.conn.execute(
-                        "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                        (plan["shot_id"], plan["element_id"], plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat()),
-                    )
-                except sqlite3.IntegrityError:
-                    self.conn.execute(
-                        "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                        (plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat(), plan["shot_id"], plan["element_id"]),
-                    )
+                current_shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (plan["shot_id"],)).fetchone()
+                if current_shot["status"] == "locked":
+                    raise DomainError("目标镜头已锁定")
+                self._apply_state(
+                    plan["shot_id"], plan["element_id"], plan["new_value"], plan["numeric_value"],
+                    f"调整方案 #{plan_id}", reviewer_id, current_shot["version"],
+                )
                 self.conn.execute(
                     "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
                     (datetime.now().isoformat(), plan["conflict_id"]),
