@@ -1,7 +1,7 @@
 import os, sys, tempfile, unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from database import ContinuityDB, DomainError
+from database import ContinuityDB, DomainError, StateConflictError
 
 class ContinuityFlowTest(unittest.TestCase):
     def setUp(self):
@@ -32,5 +32,44 @@ class ContinuityFlowTest(unittest.TestCase):
         self.db.lock_shot(self.s1,self.continuity); self.db.lock_shot(self.s2,self.continuity)
         with self.assertRaisesRegex(DomainError,"只有审片人"):
             self.db.review_adjustment(999,True,self.continuity,"无权审核")
+    def test_preview_confirm_with_revision_guard(self):
+        conflicts=self.db.check_scene(self.scene)
+        self.assertEqual(1,len(conflicts))
+        v0=self.db.shot_detail(self.s2)["shot"]["version"]
+        preview=self.db.preview_element_state(self.s2,self.injury,"重度",3,"试算改重度",self.continuity)
+        self.assertEqual(v0,preview["base_version"])
+        self.assertEqual([],preview["added_conflicts"])
+        self.assertEqual(1,len(preview["removed_conflicts"]))
+        self.assertEqual({self.s1,self.s2},{s["shot_id"] for s in preview["affected_shots"]})
+        self.assertEqual("轻度",self.db.shot_detail(self.s2)["states"][0]["state_value"])
+        self.assertEqual(v0,self.db.shot_detail(self.s2)["shot"]["version"])
+        self.assertEqual([],self.db.shot_detail(self.s2)["logs"])
+        self.db.set_element_state(self.s2,self.injury,"中度",2,"他人抢先修改",self.producer)
+        with self.assertRaises(StateConflictError) as ctx:
+            self.db.confirm_element_state(self.s2,self.injury,"重度",3,"确认",self.continuity,preview["base_version"])
+        both=ctx.exception.payload["conflict"]
+        self.assertEqual("中度",both["current_state"]["state_value"])
+        self.assertEqual("重度",both["your_state"]["state_value"])
+        self.assertEqual("制片",both["last_modified_by"])
+        v1=self.db.shot_detail(self.s2)["shot"]["version"]
+        result=self.db.confirm_element_state(self.s2,self.injury,"重度",3,"重新试算后确认",self.continuity,v1)
+        self.assertEqual(v1+1,result["version"])
+        self.assertEqual([],result["conflicts"])
+        logs=self.db.shot_detail(self.s2)["logs"]
+        self.assertEqual(1,len(logs))
+        self.assertEqual(("中度","重度",v1,v1+1),(logs[0]["old_state_value"],logs[0]["new_state_value"],logs[0]["base_version"],logs[0]["new_version"]))
+    def test_preview_added_conflicts_and_locked_shot(self):
+        self.db.check_scene(self.scene)
+        self.db.set_element_state(self.s2,self.injury,"重度",3,"先修复",self.continuity)
+        preview=self.db.preview_element_state(self.s2,self.injury,"轻度",1,"试算回退",self.continuity)
+        self.assertEqual(1,len(preview["added_conflicts"]))
+        self.assertEqual("regression",preview["added_conflicts"][0]["kind"])
+        self.assertEqual([],preview["removed_conflicts"])
+        self.assertEqual([],self.db.list_conflicts(self.scene))
+        self.db.lock_shot(self.s1,self.continuity); self.db.lock_shot(self.s2,self.continuity)
+        with self.assertRaisesRegex(DomainError,"锁定"):
+            self.db.preview_element_state(self.s2,self.injury,"轻度",1,"",self.continuity)
+        with self.assertRaisesRegex(DomainError,"锁定"):
+            self.db.confirm_element_state(self.s2,self.injury,"轻度",1,"",self.continuity,0)
 
 if __name__=="__main__": unittest.main()
